@@ -9556,6 +9556,9 @@ impl Worker {
             crate::mentions::push_everyone_id(&mut mentions);
         }
         if is_photo_album(&paths, documents) {
+            let commands = self.commands.clone();
+            let dir = self.dirs.media_cache_dir();
+            let me = self.me();
             let album_parent = client.generate_message_id().into_string();
             let album_client = client.clone();
             tokio::spawn(async move {
@@ -11122,8 +11125,7 @@ fn add_album_association(message: &mut wa::Message, chat: &str, parent: &str, in
         .unwrap_or_default();
     context.message_association = MessageField::some({
         let mut association = wa::MessageAssociation::default();
-        association.association_type =
-            Some(wa::message_association::AssociationType::MEDIA_ALBUM);
+        association.association_type = Some(wa::message_association::AssociationType::MEDIA_ALBUM);
         association.message_index = Some(index);
         association.parent_message_key = MessageField::some({
             let mut key = wa::MessageKey::default();
@@ -11679,8 +11681,10 @@ async fn quoted_outbound_with_id(
     message_id: Option<String>,
 ) -> Result<(Message, Vec<u8>), String> {
     let shown = attach_quote(&mut prepared.message, quote)?;
-    let (mut row, raw) =
-        file_outbound_with_id(client, chat, me, dir, prepared, caption, mentions, message_id).await?;
+    let (mut row, raw) = file_outbound_with_id(
+        client, chat, me, dir, prepared, caption, mentions, message_id,
+    )
+    .await?;
     row.quoted = shown;
     Ok((row, raw))
 }
@@ -12411,7 +12415,10 @@ mod tests {
                 .as_option()
                 .expect("parent key is set");
             assert_eq!(key.id.as_deref(), Some(parent));
-            assert_eq!(key.remote_jid.as_deref(), Some("15551234567@s.whatsapp.net"));
+            assert_eq!(
+                key.remote_jid.as_deref(),
+                Some("15551234567@s.whatsapp.net")
+            );
             assert_eq!(key.from_me, Some(true));
             assert_eq!(
                 album_media(&message, media(None, None, None, None))
