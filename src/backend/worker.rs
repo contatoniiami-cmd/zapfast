@@ -9555,6 +9555,86 @@ impl Worker {
         {
             crate::mentions::push_everyone_id(&mut mentions);
         }
+        if is_photo_album(&paths, documents) {
+            let album_parent = client.generate_message_id().into_string();
+            let album_client = client.clone();
+            tokio::spawn(async move {
+                let mut quote = quote;
+                for (index, path) in paths.into_iter().enumerate() {
+                    let item_quote = if index == 0 { quote.take() } else { None };
+                    let item_caption = if index == 0 { caption.clone() } else { None };
+                    let item_mentions = if index == 0 {
+                        mentions.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    let message_id = (index == 0).then(|| album_parent.clone());
+                    let outcome = async {
+                        let bytes = tokio::fs::read(&path)
+                            .await
+                            .map_err(|error| format!("{}: {error}", path.display()))?;
+                        let mime = mime_guess2::from_path(&path)
+                            .first_or_octet_stream()
+                            .to_string();
+                        let file_name = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned());
+                        let mut prepared =
+                            prepare_media(&album_client, bytes, &mime, file_name.as_deref(), false)
+                                .await?;
+                        add_album_association(
+                            &mut prepared.message,
+                            &chat,
+                            &album_parent,
+                            i32::try_from(index).unwrap_or(i32::MAX),
+                        );
+                        let (mut row, raw) = quoted_outbound_with_id(
+                            &album_client,
+                            &chat,
+                            &me,
+                            &dir,
+                            prepared,
+                            item_caption,
+                            item_mentions,
+                            item_quote,
+                            message_id,
+                        )
+                        .await?;
+                        if let Content::Image { media, .. } = &mut row.content {
+                            media.album = Some(album_parent.clone());
+                        }
+                        Ok::<_, String>((row, raw))
+                    }
+                    .await;
+                    match outcome {
+                        Ok((row, raw)) => {
+                            if commands
+                                .send(Command::Outbound {
+                                    chat: chat.clone(),
+                                    row: Box::new(row),
+                                    raw,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = commands.send(Command::Sent {
+                                chat: chat.clone(),
+                                id: String::new(),
+                                error: Some(format!(
+                                    "Could not send every photo in the album: {error}"
+                                )),
+                            });
+                            break;
+                        }
+                    }
+                }
+            });
+            return;
+        }
+
         for (index, path) in paths.into_iter().enumerate() {
             let client = client.clone();
             // Like the caption, the reply belongs to the first file.
@@ -11013,6 +11093,45 @@ fn motion_clip(base: &wa::Message) -> Option<(String, Vec<u8>)> {
     Some((parent, clip.encode_to_vec()))
 }
 
+/// Whether a multi-file selection can be sent as one photo album.
+fn is_photo_album(paths: &[PathBuf], documents: bool) -> bool {
+    !documents
+        && paths.len() > 1
+        && paths.iter().all(|path| {
+            matches!(
+                mime_guess2::from_path(path)
+                    .first_or_octet_stream()
+                    .to_string()
+                    .as_str(),
+                "image/jpeg" | "image/png" | "image/webp" | "image/bmp" | "image/tiff"
+            )
+        })
+}
+
+/// Adds WhatsApp's album association to one outgoing photo.
+fn add_album_association(message: &mut wa::Message, chat: &str, parent: &str, index: i32) {
+    let mut context = message
+        .message_context_info
+        .as_option()
+        .cloned()
+        .unwrap_or_default();
+    context.message_association = MessageField::some({
+        let mut association = wa::MessageAssociation::default();
+        association.association_type =
+            Some(wa::message_association::AssociationType::MEDIA_ALBUM);
+        association.message_index = Some(index);
+        association.parent_message_key = MessageField::some({
+            let mut key = wa::MessageKey::default();
+            key.remote_jid = Some(chat.to_owned());
+            key.from_me = Some(true);
+            key.id = Some(parent.to_owned());
+            key
+        });
+        association
+    });
+    message.message_context_info = MessageField::some(context);
+}
+
 /// Builds synthetic album attachments with explicit protocol parent ids.
 fn album_media(base: &wa::Message, mut media: Media) -> Media {
     media.album = base
@@ -11531,17 +11650,35 @@ async fn quoted_outbound(
     chat: &str,
     me: &str,
     dir: &Path,
-    mut prepared: Prepared,
+    prepared: Prepared,
     caption: Option<String>,
     mentions: Vec<String>,
     quote: Option<(wa::ContextInfo, Quoted)>,
 ) -> Result<(Message, Vec<u8>), String> {
+    quoted_outbound_with_id(
+        client, chat, me, dir, prepared, caption, mentions, quote, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn quoted_outbound_with_id(
+    client: &Client,
+    chat: &str,
+    me: &str,
+    dir: &Path,
+    mut prepared: Prepared,
+    caption: Option<String>,
+    mentions: Vec<String>,
+    quote: Option<(wa::ContextInfo, Quoted)>,
+    message_id: Option<String>,
+) -> Result<(Message, Vec<u8>), String> {
     let shown = attach_quote(&mut prepared.message, quote)?;
-    let (mut row, raw) = file_outbound(client, chat, me, dir, prepared, caption, mentions).await?;
+    let (mut row, raw) =
+        file_outbound_with_id(client, chat, me, dir, prepared, caption, mentions, message_id).await?;
     row.quoted = shown;
     Ok((row, raw))
 }
-
 /// Puts a reply's quote on an outgoing message, returning what the reply's
 /// row shows. A message kind that cannot carry a quote is an error.
 fn attach_quote(
@@ -11581,9 +11718,22 @@ pub(super) async fn file_outbound(
     chat: &str,
     me: &str,
     dir: &Path,
+    prepared: Prepared,
+    caption: Option<String>,
+    mentions: Vec<String>,
+) -> Result<(Message, Vec<u8>), String> {
+    file_outbound_with_id(client, chat, me, dir, prepared, caption, mentions, None).await
+}
+
+async fn file_outbound_with_id(
+    client: &Client,
+    chat: &str,
+    me: &str,
+    dir: &Path,
     mut prepared: Prepared,
     caption: Option<String>,
     mentions: Vec<String>,
+    message_id: Option<String>,
 ) -> Result<(Message, Vec<u8>), String> {
     if let Some(caption) = caption.filter(|caption| !caption.trim().is_empty()) {
         match &mut prepared.content {
@@ -11603,7 +11753,7 @@ pub(super) async fn file_outbound(
         }
     }
     add_mentions(&mut prepared.message, &mentions);
-    let id = client.generate_message_id().into_string();
+    let id = message_id.unwrap_or_else(|| client.generate_message_id().into_string());
     let path = media_path(
         dir,
         chat,
@@ -12231,6 +12381,57 @@ mod tests {
         let generation = worker.contact_generation;
         worker.stop_bot().await;
         assert_eq!(worker.contact_generation, generation);
+    }
+
+    #[test]
+    fn outgoing_photo_album_items_share_a_parent_and_keep_their_indexes() {
+        let parent = "photo-album-parent";
+        for index in 0..3 {
+            let mut message = wa::Message::default();
+            message.image_message = MessageField::some(Default::default());
+            add_album_association(&mut message, "15551234567@s.whatsapp.net", parent, index);
+
+            let association = message
+                .message_context_info
+                .as_option()
+                .and_then(|context| context.message_association.as_option())
+                .expect("album association is set");
+            assert_eq!(
+                association.association_type,
+                Some(wa::message_association::AssociationType::MEDIA_ALBUM)
+            );
+            assert_eq!(association.message_index, Some(index));
+            let key = association
+                .parent_message_key
+                .as_option()
+                .expect("parent key is set");
+            assert_eq!(key.id.as_deref(), Some(parent));
+            assert_eq!(key.remote_jid.as_deref(), Some("15551234567@s.whatsapp.net"));
+            assert_eq!(key.from_me, Some(true));
+            assert_eq!(
+                album_media(&message, media(None, None, None, None))
+                    .album
+                    .as_deref(),
+                Some(parent)
+            );
+        }
+    }
+
+    #[test]
+    fn only_multiple_supported_images_are_eligible_for_photo_album_sending() {
+        assert!(is_photo_album(
+            &[PathBuf::from("one.jpg"), PathBuf::from("two.png")],
+            false
+        ));
+        assert!(!is_photo_album(&[PathBuf::from("one.jpg")], false));
+        assert!(!is_photo_album(
+            &[PathBuf::from("one.jpg"), PathBuf::from("notes.pdf")],
+            false
+        ));
+        assert!(!is_photo_album(
+            &[PathBuf::from("one.jpg"), PathBuf::from("two.png")],
+            true
+        ));
     }
 
     /// An album member's bare protobuf: only the association naming its parent.
