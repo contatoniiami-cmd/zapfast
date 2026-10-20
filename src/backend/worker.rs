@@ -9560,6 +9560,7 @@ impl Worker {
             let album_client = client.clone();
             tokio::spawn(async move {
                 let mut quote = quote;
+                let mut batch = Vec::with_capacity(paths.len());
                 for (index, path) in paths.into_iter().enumerate() {
                     let item_quote = if index == 0 { quote.take() } else { None };
                     let item_caption = if index == 0 { caption.clone() } else { None };
@@ -9607,28 +9608,32 @@ impl Worker {
                     }
                     .await;
                     match outcome {
-                        Ok((row, raw)) => {
-                            if commands
-                                .send(Command::Outbound {
-                                    chat: chat.clone(),
-                                    row: Box::new(row),
-                                    raw,
-                                })
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
+                        Ok(item) => batch.push(item),
                         Err(error) => {
                             let _ = commands.send(Command::Sent {
                                 chat: chat.clone(),
                                 id: String::new(),
                                 error: Some(format!(
-                                    "Could not send every photo in the album: {error}"
+                                    "Could not prepare every photo in the album: {error}"
                                 )),
                             });
-                            break;
+                            return;
                         }
+                    }
+                }
+
+                // Queue the whole prepared album at once so other newly sent
+                // messages cannot be interleaved between its local rows.
+                for (row, raw) in batch {
+                    if commands
+                        .send(Command::Outbound {
+                            chat: chat.clone(),
+                            row: Box::new(row),
+                            raw,
+                        })
+                        .is_err()
+                    {
+                        break;
                     }
                 }
             });
